@@ -3,28 +3,39 @@ import os
 import cv2
 import numpy as np
 import pandas as pd
-# 将所有 PyQt5 替换为 PySide6 即可，其余代码几乎不用动
 from PySide6.QtWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
 
+
 # =========================
-# 核心处理类（集成降噪与追踪）
+# 算法核心类
 # =========================
 class LiverTracker:
     def __init__(self):
-        # 物理参数
+        # 物理与基础参数
         self.spatial_res = 0.71
-        self.fps = 25
+        self.max_window_size = 7
+        self.clip_limit = 2.0
 
-        # 算法状态
-        self.max_window_size = 7  # 自适应滤波窗口
-        self.clip_limit = 2.0  # CLAHE 强度
-        self.lk_params = dict(winSize=(21, 21), maxLevel=3,
-                              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
-        self.feature_params = dict(maxCorners=100, qualityLevel=0.1, minDistance=7, blockSize=7)
+        # --- 沿用你认为很好的约束参数 ---
+        self.max_drift_threshold = 30  # 离群值阈值
 
-        # 数据缓存
+        # --- LK 光流参数 ---
+        self.lk_params = dict(
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
+        )
+        # --- 特征点提取参数 ---
+        self.feature_params = dict(
+            maxCorners=100,
+            qualityLevel=0.1,
+            minDistance=7,
+            blockSize=7
+        )
+
+        # 运行时变量
         self.old_gray = None
         self.p0 = None
         self.initial_avg_y = 0
@@ -32,7 +43,8 @@ class LiverTracker:
         self.roi = None
 
     def adaptive_median_fast(self, img, window_size):
-        """高性能自适应中值滤波"""
+        """自适应中值滤波"""
+        if window_size < 3: return img
         out_img = img.copy()
         current_k = 3
         processed = np.zeros(img.shape, dtype=bool)
@@ -50,51 +62,12 @@ class LiverTracker:
             current_k += 2
         return out_img
 
-    def process_frame(self, frame, frame_idx):
-        """单帧处理管道：降噪 -> 增强 -> 追踪"""
+    def get_enhanced_frame(self, frame):
+        """处理流水线"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # 1. 实时降噪
         denoised = self.adaptive_median_fast(gray, self.max_window_size)
-
-        # 2. 实时增强
         clahe = cv2.createCLAHE(clipLimit=self.clip_limit, tileGridSize=(8, 8))
-        enhanced = clahe.apply(denoised)
-
-        # 3. 光流追踪
-        vis_frame = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-        if self.p0 is not None:
-            # 计算光流
-            p1, st, _ = cv2.calcOpticalFlowPyrLK(self.old_gray, enhanced, self.p0, None, **self.lk_params)
-
-            # 状态筛选 (st == 1 表示追踪成功)
-            if p1 is not None and len(p1) > 0:
-                good_new = p1[st == 1]
-
-                if len(good_new) > 0:
-                    # 关键修复：统一索引方式。good_new 筛选后通常是 (N, 2)
-                    # 我们直接通过列索引访问 x (0) 和 y (1)
-                    avg_x = np.mean(good_new[:, 0])
-                    avg_y = np.mean(good_new[:, 1])
-
-                    dy_mm = (avg_y - self.initial_avg_y) * self.spatial_res
-                    self.records.append({"frame": frame_idx, "disp_y_mm": dy_mm, "pts": len(good_new)})
-
-                    # 绘制点
-                    for pt in good_new:
-                        cv2.circle(vis_frame, (int(pt[0]), int(pt[1])), 3, (0, 255, 0), -1)
-
-                    # 绘制重心
-                    cv2.circle(vis_frame, (int(avg_x), int(avg_y)), 5, (0, 0, 255), -1)
-
-                    # 更新特征点用于下一帧，并保持 (N, 1, 2) 的标准格式
-                    self.p0 = good_new.reshape(-1, 1, 2)
-                else:
-                    self.p0 = None  # 点全部丢失
-
-            self.old_gray = enhanced.copy()
-
-        return vis_frame
+        return clahe.apply(denoised)
 
 
 # =========================
@@ -106,121 +79,186 @@ class MainWindow(QMainWindow):
         self.tracker = LiverTracker()
         self.img_files = []
         self.current_idx = 0
-        self.is_playing = False
-        self.initUI()
-
         self.timer = QTimer()
         self.timer.timeout.connect(self.next_frame)
+        self.initUI()
 
     def initUI(self):
-        self.setWindowTitle("肝脏运动实时追踪分析系统 - 毕设版")
-        self.setGeometry(100, 100, 1000, 800)
+        self.setWindowTitle("肝脏追踪系统")
+        self.setMinimumSize(1000, 850)
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
 
-        # --- 图像显示区 ---
-        self.image_label = QLabel("请加载文件夹并选择 ROI")
+        # 图像显示
+        self.image_label = QLabel("请加载数据")
         self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setStyleSheet("background-color: black; color: white;")
-        self.image_label.setMinimumSize(640, 480)
-        layout.addWidget(self.image_label)
+        self.image_label.setStyleSheet("background-color: black; border: 1px solid #333;")
+        self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.image_label, stretch=1)
 
-        # --- 控制面板 ---
-        ctrl_layout = QHBoxLayout()
+        # 滑动条面板
+        ctrl_panel = QHBoxLayout()
+        self.add_slider(ctrl_panel, "降噪强度", 1, 15, 7, self.update_params)
+        self.add_slider(ctrl_panel, "增强对比度", 1, 10, 2, self.update_params)
+        layout.addLayout(ctrl_panel)
 
-        # 降噪强度滑动条
-        self.add_slider(ctrl_layout, "降噪强度 (Window)", 3, 15, 7, self.update_denoise)
-        # 增强强度滑动条
-        self.add_slider(ctrl_layout, "增强强度 (CLAHE)", 1, 10, 2, self.update_clahe)
-
-        layout.addLayout(ctrl_layout)
-
-        # --- 按钮区 ---
+        # 按钮
         btn_layout = QHBoxLayout()
-        self.btn_load = QPushButton("加载文件夹")
-        self.btn_load.clicked.connect(self.load_dir)
-        self.btn_roi = QPushButton("框选 ROI 并开始")
-        self.btn_roi.clicked.connect(self.select_roi)
-        self.btn_export = QPushButton("导出 Excel")
-        self.btn_export.clicked.connect(self.export_data)
-
-        btn_layout.addWidget(self.btn_load)
-        btn_layout.addWidget(self.btn_roi)
-        btn_layout.addWidget(self.btn_export)
+        btns = [("加载文件夹", self.load_dir), ("框选ROI并追踪", self.select_roi),
+                ("重置", self.reset_tracker), ("导出数据", self.export_data)]
+        for text, func in btns:
+            btn = QPushButton(text)
+            btn.setFixedHeight(40)
+            btn.clicked.connect(func)
+            btn_layout.addWidget(btn)
         layout.addLayout(btn_layout)
 
     def add_slider(self, layout, label, min_v, max_v, def_v, callback):
         v_box = QVBoxLayout()
         lbl = QLabel(f"{label}: {def_v}")
-        v_box.addWidget(lbl)
         slider = QSlider(Qt.Horizontal)
         slider.setRange(min_v, max_v)
         slider.setValue(def_v)
-        slider.valueChanged.connect(lambda v: [callback(v), lbl.setText(f"{label}: {v}")])
+        slider.valueChanged.connect(lambda v: [callback(v, label), lbl.setText(f"{label}: {v}")])
+        v_box.addWidget(lbl)
         v_box.addWidget(slider)
         layout.addLayout(v_box)
 
-    def update_denoise(self, v):
-        # 确保窗口大小为奇数
-        self.tracker.max_window_size = v if v % 2 != 0 else v + 1
-
-    def update_clahe(self, v):
-        self.tracker.clip_limit = float(v)
+    def update_params(self, v, label):
+        if "降噪" in label:
+            self.tracker.max_window_size = v if v % 2 != 0 else v + 1
+        else:
+            self.tracker.clip_limit = float(v)
+        if self.img_files and not self.timer.isActive():
+            self.update_preview()
 
     def load_dir(self):
-        path = QFileDialog.getExistingDirectory(self, "选择图像文件夹")
+        path = QFileDialog.getExistingDirectory(self, "选择文件夹")
         if path:
             self.img_files = sorted([os.path.join(path, f) for f in os.listdir(path)
                                      if f.lower().endswith(('.bmp', '.jpg', '.png'))])
-            if self.img_files:
-                self.show_image(cv2.imread(self.img_files[0]))
+            self.current_idx = 0
+            if self.img_files: self.update_preview()
+
+    def update_preview(self):
+        raw = cv2.imread(self.img_files[self.current_idx])
+        processed = self.tracker.get_enhanced_frame(raw)
+        vis = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+        if self.tracker.roi:
+            x, y, w, h = self.tracker.roi
+            cv2.rectangle(vis, (x, y), (x + w, y + h), (255, 0, 0), 2)
+        self.show_image(vis)
 
     def select_roi(self):
         if not self.img_files: return
-        first_frame = cv2.imread(self.img_files[0])
-        roi = cv2.selectROI("ROI Selection", first_frame, False)
-        cv2.destroyWindow("ROI Selection")
+        self.timer.stop()
+        raw = cv2.imread(self.img_files[self.current_idx])
+        processed = self.tracker.get_enhanced_frame(raw)
+        temp_vis = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+
+        roi = cv2.selectROI("ROI", temp_vis, False)
+        cv2.destroyWindow("ROI")
 
         if roi[2] > 0 and roi[3] > 0:
+            self.tracker.roi = roi
             x, y, w, h = roi
-            gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
-            mask = np.zeros_like(gray)
+            mask = np.zeros_like(processed)
             mask[y:y + h, x:x + w] = 255
-            self.tracker.p0 = cv2.goodFeaturesToTrack(gray, mask=mask, **self.tracker.feature_params)
-            self.tracker.old_gray = gray
-            self.tracker.initial_avg_y = np.mean(self.tracker.p0[:, 0, 1])
-            self.is_playing = True
-            self.timer.start(int(1000 / self.tracker.fps))
+            p0 = cv2.goodFeaturesToTrack(processed, mask=mask, **self.tracker.feature_params)
+
+            if p0 is not None:
+                # 统一维度为 (N, 2)
+                self.tracker.p0 = p0.reshape(-1, 1, 2)
+                self.tracker.old_gray = processed
+                # 初始化平均 Y 值
+                temp_p0 = p0.reshape(-1, 2)
+                self.tracker.initial_avg_y = np.mean(temp_p0[:, 1])
+                self.tracker.records = []
+                self.timer.start(40)
 
     def next_frame(self):
-        if self.current_idx < len(self.img_files):
-            frame = cv2.imread(self.img_files[self.current_idx])
-            processed = self.tracker.process_frame(frame, self.current_idx)
-            self.show_image(processed)
-            self.current_idx += 1
-        else:
+        if self.current_idx >= len(self.img_files):
             self.timer.stop()
-            self.is_playing = False
+            return
+
+        raw = cv2.imread(self.img_files[self.current_idx])
+        processed = self.tracker.get_enhanced_frame(raw)
+        vis = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+
+        x, y, w, h = self.tracker.roi
+        cv2.rectangle(vis, (x, y), (x + w, y + h), (255, 0, 0), 1)
+
+        if self.tracker.p0 is not None:
+            # A. 计算光流
+            p1, st, _ = cv2.calcOpticalFlowPyrLK(
+                self.tracker.old_gray, processed, self.tracker.p0, None, **self.tracker.lk_params
+            )
+
+            if p1 is not None:
+                good_new = p1[st == 1]
+                if good_new.ndim == 3: good_new = good_new.reshape(-1, 2)
+
+                if len(good_new) > 0:
+                    # --- 核心约束：离群值剔除 (Outlier Removal) ---
+                    temp_avg_x = np.mean(good_new[:, 0])
+                    temp_avg_y = np.mean(good_new[:, 1])
+
+                    # 计算每个点到当前集群中心的距离
+                    distances = np.sqrt((good_new[:, 0] - temp_avg_x) ** 2 + (good_new[:, 1] - temp_avg_y) ** 2)
+                    # 只保留距离小于阈值的点
+                    valid_mask = distances < self.tracker.max_drift_threshold
+                    valid_new = good_new[valid_mask]
+
+                    if len(valid_new) > 0:
+                        # 计算最终平均位置
+                        final_avg_x = np.mean(valid_new[:, 0])
+                        final_avg_y = np.mean(valid_new[:, 1])
+                        dy_mm = (final_avg_y - self.tracker.initial_avg_y) * self.tracker.spatial_res
+
+                        self.tracker.records.append({"frame": self.current_idx, "dy_mm": dy_mm, "pts": len(valid_new)})
+
+                        # 绘制
+                        for pt in valid_new:
+                            cv2.circle(vis, (int(pt[0]), int(pt[1])), 3, (0, 255, 0), -1)
+                        cv2.circle(vis, (int(final_avg_x), int(final_avg_y)), 6, (0, 255, 255), 2)
+
+                        # 更新状态
+                        self.tracker.p0 = valid_new.reshape(-1, 1, 2)
+                        self.tracker.old_gray = processed
+                    else:
+                        self.tracker.p0 = None
+                else:
+                    self.tracker.p0 = None
+
+        self.show_image(vis)
+        self.current_idx += 1
 
     def show_image(self, img):
-        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_img.shape
-        bytes_per_line = ch * w
-        q_img = QImage(rgb_img.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        self.image_label.setPixmap(QPixmap.fromImage(q_img).scaled(self.image_label.width(),
-                                                                   self.image_label.height(), Qt.KeepAspectRatio))
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        pix = QPixmap.fromImage(qimg)
+        self.image_label.setPixmap(pix.scaled(self.image_label.width(), self.image_label.height(),
+                                              Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def reset_tracker(self):
+        self.timer.stop()
+        self.current_idx = 0
+        self.tracker.p0 = None
+        self.tracker.roi = None
+        if self.img_files: self.update_preview()
 
     def export_data(self):
-        save_path, _ = QFileDialog.getSaveFileName(self, "保存数据", "", "Excel Files (*.xlsx)")
-        if save_path and self.tracker.records:
-            pd.DataFrame(self.tracker.records).to_excel(save_path, index=False)
-            print("数据导出成功！")
+        path, _ = QFileDialog.getSaveFileName(self, "保存", "", "Excel (*.xlsx)")
+        if path and self.tracker.records:
+            pd.DataFrame(self.tracker.records).to_excel(path, index=False)
+            QMessageBox.information(self, "成功", "导出成功")
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
