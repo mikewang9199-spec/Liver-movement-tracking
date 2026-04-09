@@ -7,21 +7,23 @@ from PySide6.QtWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
 
+
 # =========================
 # 算法核心类
 # =========================
 class LiverTracker:
     def __init__(self):
-        self.spatial_res = 0.71
+        self.spatial_res = 0.71  # 空间分辨率 (mm/pixel)
         self.max_window_size = 7
         self.clip_limit = 2.0
-        self.max_drift_threshold = 30
 
+        # 光流参数
         self.lk_params = dict(
-            winSize=(31, 31),  # 调大窗口以增强单点追踪稳定性
+            winSize=(31, 31),
             maxLevel=3,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
         )
+        # 特征点检测参数
         self.feature_params = dict(
             maxCorners=100,
             qualityLevel=0.1,
@@ -56,6 +58,7 @@ class LiverTracker:
         return out_img
 
     def get_enhanced_frame(self, frame):
+        if frame is None: return None
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         denoised = self.adaptive_median_fast(gray, self.max_window_size)
         clahe = cv2.createCLAHE(clipLimit=self.clip_limit, tileGridSize=(8, 8))
@@ -69,21 +72,22 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.tracker = LiverTracker()
-        self.img_files = []
+        self.cap = None
+        self.current_frame = None
         self.current_idx = 0
         self.timer = QTimer()
         self.timer.timeout.connect(self.next_frame)
         self.initUI()
 
     def initUI(self):
-        self.setWindowTitle("肝脏追踪分析系统")
+        self.setWindowTitle("肝脏追踪分析系统 (视频版 - 无约束)")
         self.setMinimumSize(1100, 850)
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
 
-        # --- 顶部工具栏 ---
+        # --- 工具栏 ---
         top_bar = QHBoxLayout()
         self.mode_selector = QComboBox()
         self.mode_selector.addItems(["ROI 区域集群追踪", "单点手动追踪"])
@@ -94,13 +98,13 @@ class MainWindow(QMainWindow):
         layout.addLayout(top_bar)
 
         # 图像显示
-        self.image_label = QLabel("请加载数据")
+        self.image_label = QLabel("请加载视频文件")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setStyleSheet("background-color: black; border: 1px solid #333;")
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.image_label, stretch=1)
 
-        # 滑动条
+        # 控制面板
         ctrl_panel = QHBoxLayout()
         self.add_slider(ctrl_panel, "降噪强度", 1, 15, 7, self.update_params)
         self.add_slider(ctrl_panel, "增强对比度", 1, 10, 2, self.update_params)
@@ -108,11 +112,11 @@ class MainWindow(QMainWindow):
 
         # 按钮
         btn_layout = QHBoxLayout()
-        self.btn_load = QPushButton("加载文件夹")
-        self.btn_load.clicked.connect(self.load_dir)
+        self.btn_load = QPushButton("加载视频")
+        self.btn_load.clicked.connect(self.load_video)
         self.btn_select = QPushButton("选择追踪目标")
         self.btn_select.clicked.connect(self.start_selection)
-        self.btn_reset = QPushButton("重置")
+        self.btn_reset = QPushButton("重置视频")
         self.btn_reset.clicked.connect(self.reset_tracker)
         self.btn_export = QPushButton("导出数据")
         self.btn_export.clicked.connect(self.export_data)
@@ -142,20 +146,23 @@ class MainWindow(QMainWindow):
             self.tracker.max_window_size = v if v % 2 != 0 else v + 1
         else:
             self.tracker.clip_limit = float(v)
-        if self.img_files and not self.timer.isActive():
-            self.update_preview()
+        if self.current_frame is not None and not self.timer.isActive():
+            self.update_preview(self.current_frame)
 
-    def load_dir(self):
-        path = QFileDialog.getExistingDirectory(self, "选择文件夹")
+    def load_video(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择视频文件", "", "Video Files (*.mp4 *.avi *.mkv)")
         if path:
-            self.img_files = sorted([os.path.join(path, f) for f in os.listdir(path)
-                                     if f.lower().endswith(('.bmp', '.jpg', '.png'))])
+            if self.cap is not None: self.cap.release()
+            self.cap = cv2.VideoCapture(path)
             self.current_idx = 0
-            if self.img_files: self.update_preview()
+            ret, frame = self.cap.read()
+            if ret:
+                self.current_frame = frame
+                self.update_preview(frame)
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-    def update_preview(self):
-        raw = cv2.imread(self.img_files[self.current_idx])
-        processed = self.tracker.get_enhanced_frame(raw)
+    def update_preview(self, frame):
+        processed = self.tracker.get_enhanced_frame(frame)
         vis = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
         if self.tracker.roi and self.tracker.mode == "ROI":
             x, y, w, h = self.tracker.roi
@@ -163,42 +170,37 @@ class MainWindow(QMainWindow):
         self.show_image(vis)
 
     def start_selection(self):
-        if not self.img_files: return
+        if self.cap is None: return
         self.timer.stop()
 
-        raw = cv2.imread(self.img_files[self.current_idx])
-        processed = self.tracker.get_enhanced_frame(raw)
+        # 获取当前帧
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_idx)
+        ret, frame = self.cap.read()
+        if not ret: return
+
+        processed = self.tracker.get_enhanced_frame(frame)
         temp_vis = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
 
         if self.tracker.mode == "ROI":
-            # --- 修复后的 ROI 选择逻辑 ---
             win_name = "ROI_Selection"
-            cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)  # 显式创建窗口
-            cv2.resizeWindow(win_name, 800, 600)
-            # 参数：窗口名, 图像, 是否显示中心十字, 是否从中心开始框选
+            cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
             roi = cv2.selectROI(win_name, temp_vis, False, False)
             cv2.destroyWindow(win_name)
-
             if roi[2] > 0 and roi[3] > 0:
                 self.tracker.roi = roi
                 x, y, w, h = roi
                 mask = np.zeros_like(processed)
                 mask[y:y + h, x:x + w] = 255
                 p0 = cv2.goodFeaturesToTrack(processed, mask=mask, **self.tracker.feature_params)
-                if p0 is not None:
-                    self.init_tracking(processed, p0)
+                if p0 is not None: self.init_tracking(processed, p0)
         else:
-            # --- 修复后的单点模式逻辑 ---
             win_name = "Point_Selection"
             cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-            print("左键点击目标点，完成后按任意键(如空格/Esc)关闭窗口")
-
             point_data = []
 
             def on_mouse(event, x, y, flags, param):
                 if event == cv2.EVENT_LBUTTONDOWN:
                     point_data.append([x, y])
-                    # 实时在选择窗口画点反馈
                     cv2.circle(temp_vis, (x, y), 5, (0, 255, 255), -1)
                     cv2.imshow(win_name, temp_vis)
 
@@ -206,7 +208,6 @@ class MainWindow(QMainWindow):
             cv2.setMouseCallback(win_name, on_mouse)
             cv2.waitKey(0)
             cv2.destroyWindow(win_name)
-
             if point_data:
                 p0 = np.array(point_data, dtype=np.float32).reshape(-1, 1, 2)
                 self.init_tracking(processed, p0)
@@ -214,63 +215,55 @@ class MainWindow(QMainWindow):
     def init_tracking(self, processed_img, p0):
         self.tracker.p0 = p0
         self.tracker.old_gray = processed_img
-        temp_p0 = p0.reshape(-1, 2)
-        self.tracker.initial_avg_y = np.mean(temp_p0[:, 1])
+        self.tracker.initial_avg_y = np.mean(p0.reshape(-1, 2)[:, 1])
         self.tracker.records = []
-        self.timer.start(100)
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.timer.start(int(1000 / fps) if fps > 0 else 33)
 
     def next_frame(self):
-        if self.current_idx >= len(self.img_files):
+        if self.cap is None: return
+        ret, raw = self.cap.read()
+        if not ret:
             self.timer.stop()
             return
 
-        raw = cv2.imread(self.img_files[self.current_idx])
+        self.current_frame = raw
         processed = self.tracker.get_enhanced_frame(raw)
         vis = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
 
-        # --- 关键修改：在这里加上绘制 ROI 框的代码 ---
         if self.tracker.roi is not None:
-            x_r, y_r, w_r, h_r = self.tracker.roi
-            # 绘制原始 ROI 框 (蓝色, 线宽为 1)
-            cv2.rectangle(vis, (x_r, y_r), (x_r + w_r, y_r + h_r), (255, 0, 0), 1)
+            x, y, w, h = self.tracker.roi
+            cv2.rectangle(vis, (x, y), (x + w, y + h), (255, 0, 0), 1)
 
         if self.tracker.p0 is not None:
-            # A. 计算基础光流
+            # 计算光流
             p1, st, _ = cv2.calcOpticalFlowPyrLK(
                 self.tracker.old_gray, processed, self.tracker.p0, None, **self.tracker.lk_params
             )
 
-            if p1 is not None:
-                good_new = p1[st == 1]
-                if good_new.ndim == 3: good_new = good_new.reshape(-1, 2)
+            # 仅保留成功追踪到的点 (st==1)
+            if p1 is not None and len(p1[st == 1]) > 0:
+                good_new = p1[st == 1].reshape(-1, 2)
 
-                if len(good_new) > 0:
-                    # --- 离群值约束逻辑 ---
-                    if self.tracker.mode == "ROI":
-                        temp_avg_x = np.mean(good_new[:, 0])
-                        temp_avg_y = np.mean(good_new[:, 1])
-                        distances = np.sqrt((good_new[:, 0] - temp_avg_x) ** 2 + (good_new[:, 1] - temp_avg_y) ** 2)
-                        valid_mask = distances < self.tracker.max_drift_threshold
-                        valid_new = good_new[valid_mask]
-                    else:
-                        valid_new = good_new
+                # --- 取消了距离中值/平均值的离群约束，直接使用所有有效点 ---
+                final_avg_y = np.mean(good_new[:, 1])
+                dy_mm = (final_avg_y - self.tracker.initial_avg_y) * self.tracker.spatial_res
 
-                    if len(valid_new) > 0:
-                        final_avg_y = np.mean(valid_new[:, 1])
-                        dy_mm = (final_avg_y - self.tracker.initial_avg_y) * self.tracker.spatial_res
-                        self.tracker.records.append({"frame": self.current_idx, "dy_mm": dy_mm})
+                # 记录数据
+                self.tracker.records.append({
+                    "frame": int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)),
+                    "dy_mm": dy_mm
+                })
 
-                        # B. 绘制有效的追踪点 (绿色)
-                        for pt in valid_new:
-                            cv2.circle(vis, (int(pt[0]), int(pt[1])), 3, (0, 255, 0), -1)
+                # 绘制所有点
+                for pt in good_new:
+                    cv2.circle(vis, (int(pt[0]), int(pt[1])), 3, (0, 255, 0), -1)
 
-                        # 更新状态
-                        self.tracker.p0 = valid_new.reshape(-1, 1, 2)
-                        self.tracker.old_gray = processed
-                    else:
-                        self.tracker.p0 = None
-                else:
-                    self.tracker.p0 = None
+                # 更新追踪状态
+                self.tracker.p0 = good_new.reshape(-1, 1, 2)
+                self.tracker.old_gray = processed
+            else:
+                self.tracker.p0 = None
 
         self.show_image(vis)
         self.current_idx += 1
@@ -280,22 +273,27 @@ class MainWindow(QMainWindow):
         h, w, ch = rgb.shape
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
         pix = QPixmap.fromImage(qimg)
-        if not self.image_label.width(): return
-        self.image_label.setPixmap(pix.scaled(self.image_label.width(), self.image_label.height(),
-                                              Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        if self.image_label.width() > 0:
+            self.image_label.setPixmap(pix.scaled(self.image_label.width(), self.image_label.height(),
+                                                  Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def reset_tracker(self):
         self.timer.stop()
         self.current_idx = 0
         self.tracker.p0 = None
         self.tracker.roi = None
-        if self.img_files: self.update_preview()
+        if self.cap is not None:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self.cap.read()
+            if ret:
+                self.update_preview(frame)
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     def export_data(self):
-        path, _ = QFileDialog.getSaveFileName(self, "保存", "", "Excel (*.xlsx)")
+        path, _ = QFileDialog.getSaveFileName(self, "导出Excel数据", "", "Excel (*.xlsx)")
         if path and self.tracker.records:
             pd.DataFrame(self.tracker.records).to_excel(path, index=False)
-            QMessageBox.information(self, "成功", "导出成功")
+            QMessageBox.information(self, "成功", "数据导出成功")
 
 
 if __name__ == "__main__":
